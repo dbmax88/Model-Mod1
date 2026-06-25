@@ -187,6 +187,21 @@ def topo_sort_joints(joint_node_indices, parent):
         f"Topo sort lost joints: {len(order)} vs {len(joint_node_indices)}"
     return order, joint_parent
 
+def _topo_sort_nodes(node_set, parent_map):
+    """Sort nodes in node_set parent-before-child (DFS pre-order)."""
+    order = []
+    visited = set()
+    def visit(n):
+        if n in visited: return
+        visited.add(n)
+        p = parent_map[n]
+        if p is not None and p in node_set:
+            visit(p)
+        order.append(n)
+    for n in sorted(node_set):
+        visit(n)
+    return order
+
 def joint_usd_paths(sorted_joints, joint_parent, gltf):
     """Build USD joint path strings (parent/child/...) for sorted joints."""
     nodes = gltf["nodes"]
@@ -273,34 +288,68 @@ def get_node_trs(gltf_node):
     s = np.array(gltf_node.get("scale",[1,1,1]), dtype=np.float64)
     return t, r, s
 
-def build_anim_frames(anim_data, sorted_joints, gltf):
+def build_anim_frames(anim_data, sorted_joints, joint_parent, parent_map, gltf):
     """
-    For each of N_FRAMES frames, for each joint in sorted order,
-    sample the animated TRS (or use rest TRS if no channels).
-    Returns: T_frames, R_frames, S_frames — each shape (N_FRAMES, N_JOINTS, 3/4/3)
+    Build per-frame USD joint-local TRS for N_FRAMES frames.
+
+    Root USD joints store their full glTF world matrix (accounts for non-joint
+    ancestor nodes such as the Blender armature node).
+    Non-root USD joints store inv(parent_world) @ child_world.
+
+    This ensures the stored TRS matches the coordinate space expected by USD
+    UsdSkel, which multiplies up the joint hierarchy to recover world transforms.
     """
     nodes = gltf["nodes"]
     N = len(sorted_joints)
+
+    # All glTF nodes needed: joints + every ancestor up to the scene root
+    needed = set()
+    for j in sorted_joints:
+        n = j
+        while n is not None:
+            needed.add(n)
+            n = parent_map[n]
+    needed_order = _topo_sort_nodes(needed, parent_map)
+
     T_all = np.zeros((N_FRAMES, N, 3))
     R_all = np.zeros((N_FRAMES, N, 4))
     S_all = np.ones((N_FRAMES, N, 3))
+
     for fi in range(N_FRAMES):
         t_sec = fi / FPS
-        for ji, node_idx in enumerate(sorted_joints):
-            nd = nodes[node_idx]
+
+        # Build per-frame glTF world matrices for all needed nodes
+        frame_world = {}
+        for nidx in needed_order:
+            nd = nodes[nidx]
             rest_t, rest_r, rest_s = get_node_trs(nd)
-            if node_idx in anim_data:
-                ch = anim_data[node_idx]
+            if nidx in anim_data:
+                ch = anim_data[nidx]
                 T = sample_channel(*ch['T'], t_sec) if 'T' in ch else rest_t
                 R = sample_channel(*ch['R'], t_sec) if 'R' in ch else rest_r
                 S = sample_channel(*ch['S'], t_sec) if 'S' in ch else rest_s
             else:
                 T, R, S = rest_t, rest_r, rest_s
-            # Normalise quaternion
             R = R / (np.linalg.norm(R) or 1.0)
-            T_all[fi, ji] = T
-            R_all[fi, ji] = R
-            S_all[fi, ji] = S
+            local_m = trs_to_mat(T, R, S)
+            p = parent_map[nidx]
+            frame_world[nidx] = (frame_world[p] @ local_m) \
+                if (p is not None and p in frame_world) else local_m
+
+        # Convert glTF world matrices → USD joint-local TRS
+        for si, nidx in enumerate(sorted_joints):
+            world_j = frame_world[nidx]
+            p_nidx = joint_parent[nidx]
+            if p_nidx is None:
+                # Root joint: USD local == glTF world (no USD parent)
+                local_usd = world_j
+            else:
+                local_usd = np.linalg.inv(frame_world[p_nidx]) @ world_j
+            t_v, r_v, s_v = mat_to_trs(local_usd)
+            T_all[fi, si] = t_v
+            R_all[fi, si] = r_v
+            S_all[fi, si] = s_v
+
     return T_all, R_all, S_all
 
 # ─── Texture extraction ──────────────────────────────────────────────────────
@@ -361,22 +410,19 @@ def extract_mesh(gltf, bin_data, mesh_idx, skin_joints_ordered,
 
 # ─── Check rest vs bind pose ─────────────────────────────────────────────────
 
-def check_rest_bind(sorted_joints, world_mats, ibm_array, body_skin_joints):
+def check_rest_bind(sorted_joints, world_mats, ibm_array, body_skin_joints, body_mesh_world):
     """
-    Check if bind_world = C_global @ rest_world for all joints.
-    ibm_array: (N_body, 16) float64
-    Returns: C_global (4x4) or None if rest==bind
+    Verify bind_world ≈ rest_world for all joints (C ≈ I expected).
+    bind_world = body_mesh_world @ inv(IBM)  — correct formula.
     """
-    js_set = set(body_skin_joints)
     body_idx = {nidx: i for i, nidx in enumerate(body_skin_joints)}
     C_list = []
     for j in sorted_joints[:20]:
         if j not in body_idx: continue
         bi = body_idx[j]
         ibm = ibm_array[bi].reshape(4,4, order='F')
-        bind_w = np.linalg.inv(ibm)
+        bind_w = body_mesh_world @ np.linalg.inv(ibm)
         rest_w = world_mats[j]
-        # C = bind_w @ inv(rest_w)
         try:
             C = bind_w @ np.linalg.inv(rest_w)
             C_list.append(C)
@@ -389,15 +435,14 @@ def check_rest_bind(sorted_joints, world_mats, ibm_array, body_skin_joints):
     print(f"  rest/bind check: max C deviation across first 20 joints: {max_diff:.2e}")
     is_identity = np.linalg.norm(C0 - np.eye(4)) < 1e-3
     if is_identity:
-        print("  → rest == bind (C ≈ identity). No correction needed.")
+        print("  → rest == bind ✓")
         return None
     print(f"  → rest ≠ bind. C_global:\n{C0}")
     if max_diff < 1e-3:
         print("  → C_global is consistent across joints.")
         return C0
-    else:
-        print("  WARNING: C_global is NOT consistent — novel issue, proceeding with local TRS anyway")
-        return None
+    print("  WARNING: C_global NOT consistent across joints")
+    return None
 
 # ─── USD helpers ─────────────────────────────────────────────────────────────
 
@@ -892,7 +937,7 @@ def _skinned_bounds(fi, mesh_data, sorted_joints, bind_worlds,
             w = float(wt[vi,k])
             if w < 1e-5: continue
             jsi = int(ji[vi,k])
-            skin_mat = anim_worlds[jsi] @ ibm_sorted_global[jsi]
+            skin_mat = anim_worlds[jsi] @ np.linalg.inv(bind_worlds[jsi])
             sp += w * (skin_mat @ p)[:3]
         pts.append(sp)
     pts = np.array(pts)
@@ -935,11 +980,8 @@ def verify_usdz(usdz_path, anim_path, skel_path, sorted_joints,
     root_prim = stage.GetPrimAtPath("/World/Octopus/SkelRoot")
     cache.Populate(UsdSkel.Root(root_prim), Usd.TraverseInstanceProxies())
     body_prim = stage.GetPrimAtPath("/World/Octopus/SkelRoot/BodyMesh")
-    query = cache.GetSkelQuery(UsdSkel.Root(root_prim))
-    if not query:
-        # Try finding skeleton directly
-        skel_prim = stage.GetPrimAtPath(skel_path)
-        query = cache.GetSkelQuery(UsdSkel.Root(UsdSkel.Root(root_prim)))
+    skel_prim = stage.GetPrimAtPath(skel_path)
+    query = cache.GetSkelQuery(UsdSkel.Skeleton(skel_prim)) if skel_prim else None
 
     bboxes = []
     for fi in [0, 25, 50, 75, 100]:
@@ -1042,10 +1084,20 @@ if __name__ == "__main__":
             ibm = ibm_raw[ii].reshape(4,4, order='F')
             ibm_sorted.append(ibm)
         ibm_sorted_global = ibm_sorted
-        bind_worlds = [np.linalg.inv(ibm) for ibm in ibm_sorted]
+
+        # Find body mesh world transform (needed for correct bind_worlds formula).
+        # IBM_k = inv(J_bind_world_k) * M_mesh_world  →  J_bind_world_k = M_mesh_world @ inv(IBM_k)
+        _nodes_early = gltf["nodes"]
+        _body_mesh_node_early = next(nd for nd in _nodes_early
+                                     if nd.get("skin") == body_skin_idx and "mesh" in nd)
+        _body_nd_idx_early = _nodes_early.index(_body_mesh_node_early)
+        body_mesh_world_early = world_mats[_body_nd_idx_early]
+
+        bind_worlds = [body_mesh_world_early @ np.linalg.inv(ibm) for ibm in ibm_sorted]
 
         print("Checking rest vs bind pose…")
-        C_global = check_rest_bind(sorted_joints, world_mats, ibm_raw, body_skin_joints)
+        C_global = check_rest_bind(sorted_joints, world_mats, ibm_raw, body_skin_joints,
+                                   body_mesh_world_early)
 
         rest_locals_mat = []
         for si, nidx in enumerate(sorted_joints):
@@ -1061,7 +1113,8 @@ if __name__ == "__main__":
         anim_data = extract_animation(gltf, bin_data, 0)
         print(f"  {len(anim_data)} nodes have animation channels")
         print("Sampling 101 frames…")
-        T_all, R_all, S_all = build_anim_frames(anim_data, sorted_joints, gltf)
+        T_all, R_all, S_all = build_anim_frames(anim_data, sorted_joints,
+                                                  joint_parent, parent, gltf)
 
         print("Extracting textures…")
         tex_paths = extract_textures(gltf, bin_data, WORK_DIR / "textures")
