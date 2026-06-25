@@ -1,1 +1,4 @@
 giant_pacific_octopus_swim_A3.usdz
+__pycache__/
+*.pyc
+pipeline/usd_work/
