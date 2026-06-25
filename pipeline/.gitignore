@@ -3,3 +3,4 @@ node_modules/
 *.usdz
 *.pkl
 *.png
+usd_work/
