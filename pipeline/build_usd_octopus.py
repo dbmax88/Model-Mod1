@@ -15,7 +15,7 @@ GLB_IN  = "giant_pacific_octopus_swim_A3.glb"
 WORK_DIR = Path("usd_work");  WORK_DIR.mkdir(exist_ok=True)
 USDA_OUT = str(WORK_DIR / "octopus.usda")
 USDC_OUT = str(WORK_DIR / "octopus.usdc")
-USDZ_OUT = "giant_pacific_octopus_swim_A3.usdz"
+USDZ_OUT = "Hee_AR.usdz"
 
 FPS = 24.0
 N_FRAMES = 101  # 0..100
@@ -127,7 +127,7 @@ def compute_world_mats(gltf, parent):
         if world[i] is None:
             lm = node_local_mat(nodes[i])
             p = parent[i]
-            world[i] = get(p) @ lm if p is not None else lm
+            world[i] = lm @ get(p) if p is not None else lm
         return world[i]
     for i in range(len(nodes)): get(i)
     return world
@@ -333,7 +333,7 @@ def build_anim_frames(anim_data, sorted_joints, joint_parent, parent_map, gltf):
             R = R / (np.linalg.norm(R) or 1.0)
             local_m = trs_to_mat(T, R, S)
             p = parent_map[nidx]
-            frame_world[nidx] = (frame_world[p] @ local_m) \
+            frame_world[nidx] = (local_m @ frame_world[p]) \
                 if (p is not None and p in frame_world) else local_m
 
         # Convert glTF world matrices → USD joint-local TRS
@@ -344,7 +344,7 @@ def build_anim_frames(anim_data, sorted_joints, joint_parent, parent_map, gltf):
                 # Root joint: USD local == glTF world (no USD parent)
                 local_usd = world_j
             else:
-                local_usd = np.linalg.inv(frame_world[p_nidx]) @ world_j
+                local_usd = world_j @ np.linalg.inv(frame_world[p_nidx])
             t_v, r_v, s_v = mat_to_trs(local_usd)
             T_all[fi, si] = t_v
             R_all[fi, si] = r_v
@@ -413,7 +413,7 @@ def extract_mesh(gltf, bin_data, mesh_idx, skin_joints_ordered,
 def check_rest_bind(sorted_joints, world_mats, ibm_array, body_skin_joints, body_mesh_world):
     """
     Verify bind_world ≈ rest_world for all joints (C ≈ I expected).
-    bind_world = body_mesh_world @ inv(IBM)  — correct formula.
+    bind_world = inv(IBM_col).T  — correct row-major formula.
     """
     body_idx = {nidx: i for i, nidx in enumerate(body_skin_joints)}
     C_list = []
@@ -421,7 +421,7 @@ def check_rest_bind(sorted_joints, world_mats, ibm_array, body_skin_joints, body
         if j not in body_idx: continue
         bi = body_idx[j]
         ibm = ibm_array[bi].reshape(4,4, order='F')
-        bind_w = body_mesh_world @ np.linalg.inv(ibm)
+        bind_w = np.linalg.inv(ibm).T
         rest_w = world_mats[j]
         try:
             C = bind_w @ np.linalg.inv(rest_w)
@@ -920,7 +920,7 @@ def _skinned_bounds(fi, mesh_data, sorted_joints, bind_worlds,
                     p_nidx_si = node_to_sorted_idx[p_nidx]
                 break
         if p_nidx_si is not None and anim_worlds[p_nidx_si] is not None:
-            anim_worlds[si] = anim_worlds[p_nidx_si] @ lm
+            anim_worlds[si] = lm @ anim_worlds[p_nidx_si]
         else:
             anim_worlds[si] = lm
 
@@ -937,8 +937,8 @@ def _skinned_bounds(fi, mesh_data, sorted_joints, bind_worlds,
             w = float(wt[vi,k])
             if w < 1e-5: continue
             jsi = int(ji[vi,k])
-            skin_mat = anim_worlds[jsi] @ np.linalg.inv(bind_worlds[jsi])
-            sp += w * (skin_mat @ p)[:3]
+            skin_mat = np.linalg.inv(bind_worlds[jsi]) @ anim_worlds[jsi]
+            sp += w * (p @ skin_mat)[:3]
         pts.append(sp)
     pts = np.array(pts)
     return pts.min(axis=0), pts.max(axis=0)
@@ -1093,7 +1093,7 @@ if __name__ == "__main__":
         _body_nd_idx_early = _nodes_early.index(_body_mesh_node_early)
         body_mesh_world_early = world_mats[_body_nd_idx_early]
 
-        bind_worlds = [body_mesh_world_early @ np.linalg.inv(ibm) for ibm in ibm_sorted]
+        bind_worlds = [np.linalg.inv(ibm).T for ibm in ibm_sorted]
 
         print("Checking rest vs bind pose…")
         C_global = check_rest_bind(sorted_joints, world_mats, ibm_raw, body_skin_joints,
@@ -1106,7 +1106,7 @@ if __name__ == "__main__":
                 local_m = bind_worlds[si]
             else:
                 p_si = node_to_sorted_idx[p_nidx]
-                local_m = np.linalg.inv(bind_worlds[p_si]) @ bind_worlds[si]
+                local_m = bind_worlds[si] @ np.linalg.inv(bind_worlds[p_si])
             rest_locals_mat.append(local_m)
 
         print("Extracting animation…")
@@ -1129,8 +1129,7 @@ if __name__ == "__main__":
         eyes_nd_idx = nodes.index(eyes_mesh_node)
         body_mesh_world = world_mats[body_nd_idx]
         eyes_mesh_world = world_mats[eyes_nd_idx]
-        is_identity = np.allclose(body_mesh_world, np.eye(4), atol=1e-4)
-        print(f"Body mesh node world transform {'≈ identity ✓' if is_identity else '≠ identity — baking into vertices'}")
+        print(f"Body mesh node world transform:\n{body_mesh_world}")
 
         print("Extracting meshes…")
         body_data = extract_mesh(gltf, bin_data, body_mesh_node["mesh"],
@@ -1139,17 +1138,6 @@ if __name__ == "__main__":
                                  eyes_skin_joints, sorted_joints, node_to_sorted_idx)
         print(f"  Body: {len(body_data['pos'])} verts, {len(body_data['indices'])//3} tris")
         print(f"  Eyes: {len(eyes_data['pos'])} verts, {len(eyes_data['indices'])//3} tris")
-
-        # If mesh world != identity, bake into vertices and adjust IBM
-        if not is_identity:
-            M = body_mesh_world
-            h = np.ones((len(body_data['pos']),1), dtype=np.float32)
-            body_data['pos'] = (np.hstack([body_data['pos'],h]) @ M.T.astype(np.float32))[:,:3]
-            body_data['norm'] = (body_data['norm'] @ M[:3,:3].T.astype(np.float32))
-        M2 = eyes_mesh_world
-        if not np.allclose(M2, np.eye(4), atol=1e-4):
-            h = np.ones((len(eyes_data['pos']),1), dtype=np.float32)
-            eyes_data['pos'] = (np.hstack([eyes_data['pos'],h]) @ M2.T.astype(np.float32))[:,:3]
 
         print("Computing animated bounds…")
         min_y_global = float('inf'); max_extent = 0.0
